@@ -33,7 +33,7 @@ MARKER_MM = 5.3  # сторона чёрного квадрата, мм
 CAL_Z_MM = 83
 STEP_FACTOR = 0.80  # смарт-шаг = 0.80 × FOV  (≈ 20 %)
 CONFIG_FILE = "aruco_calib.json"
-DEFAULT_RESOLUTION = "3840x2160"
+DEFAULT_RESOLUTION = "2028x1520"
 CENTER_X = 54
 CENTER_Y = 110
 
@@ -82,21 +82,21 @@ class CameraManager:
 
     def list_cameras(self):
         if self.picamera2_cls:
-            media_devices = sorted(
-                Path("/dev").glob("media*"),
-                key=lambda p: p.name,
-            )
-            if media_devices:
-                return [(str(device), f"Media {device}") for device in media_devices]
-            infos = self.picamera2_cls.global_camera_info()
-            if not infos:
-                return [("0", "Camera 0")]
-            return [(str(idx), info.get("Model", f"Camera {idx}")) for idx, info in enumerate(infos)]
+            return self._list_cameras_picamera2()
+        return self._list_video_devices_opencv()
+
+    def _list_cameras_picamera2(self):
+        infos = self.picamera2_cls.global_camera_info()
+        out = []
+        for idx, info in enumerate(infos):
+            model = info.get("Model", f"Camera {idx}")
+            out.append((str(idx), f"Camera {idx}: {model}"))
+        if not out:
+            out = [("0", "Camera 0")]
+        return out
+
+    def _list_video_devices_opencv(self):
         devices = []
-        for media_device in sorted(Path("/dev").glob("media*"), key=lambda p: p.name):
-            devices.append((str(media_device), f"Media {media_device}"))
-        if devices:
-            return devices
         for idx in range(10):
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if cap.isOpened():
@@ -104,27 +104,60 @@ class CameraManager:
             cap.release()
         return devices or [("0", "/dev/video0")]
 
+    def _ensure_picam_config(self, requested_size):
+        candidates = [
+            requested_size,
+            (2028, 1520),
+            (1920, 1080),
+            (1332, 990),
+            (4056, 3040),
+        ]
+        last_err = None
+        for size in candidates:
+            try:
+                config = self.picam.create_still_configuration(main={"size": size})
+                self.picam.configure(config)
+                self.picam.start()
+                time.sleep(0.15)
+                return size
+            except Exception as exc:
+                last_err = exc
+                try:
+                    self.picam.stop()
+                except Exception:
+                    pass
+        raise RuntimeError(f"Cannot configure Picamera2. Last error: {last_err}")
+
     def _ensure_picam(self, cam_id, resolution):
         if self.picam and self.picam_id != cam_id:
             self.picam.close()
             self.picam = None
         if not self.picam:
-            cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
-            self.picam = self.picamera2_cls(cam_arg)
+            cam_index = int(cam_id)
+            self.picam = self.picamera2_cls(cam_index)
             self.picam_id = cam_id
             self.picam_resolution = None
         if self.picam_resolution != resolution:
-            config = self.picam.create_still_configuration(main={"size": resolution})
-            self.picam.configure(config)
-            self.picam.start()
-            time.sleep(0.1)
-            self.picam_resolution = resolution
+            try:
+                self.picam.stop()
+            except Exception:
+                pass
+            self.picam_resolution = self._ensure_picam_config(resolution)
 
     def snap(self, cam_id, width=1920, height=1080):
         with self.lock:
             if self.picamera2_cls:
-                self._ensure_picam(cam_id, (width, height))
-                return self.picam.capture_array()
+                try:
+                    self._ensure_picam(cam_id, (width, height))
+                    frame = self.picam.capture_array()
+                    if frame is None:
+                        return None
+                    if frame.ndim == 3 and frame.shape[2] >= 3:
+                        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    return frame
+                except Exception as exc:
+                    self.logger.info("Picamera2 snap failed: %s", exc)
+                    return None
             backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
             cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
             cap = cv2.VideoCapture(cam_arg, backend)
@@ -142,9 +175,13 @@ class CameraManager:
             if self.picamera2_cls:
                 if resolution is None:
                     resolution = self.picam_resolution or parse_resolution(DEFAULT_RESOLUTION)
-                self._ensure_picam(cam_id, resolution)
-                self.picam.set_controls({"ExposureTime": exposure})
-                return True
+                try:
+                    self._ensure_picam(cam_id, resolution)
+                    self.picam.set_controls({"ExposureTime": exposure})
+                    return True
+                except Exception as exc:
+                    self.logger.info("Picamera2 exposure failed: %s", exc)
+                    return False
             backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
             cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
             cap = cv2.VideoCapture(cam_arg, backend)
@@ -157,6 +194,10 @@ class CameraManager:
     def close(self):
         with self.lock:
             if self.picam:
+                try:
+                    self.picam.stop()
+                except Exception:
+                    pass
                 self.picam.close()
                 self.picam = None
                 self.picam_id = None
@@ -247,6 +288,7 @@ class FocusPreviewDialog(QtWidgets.QDialog):
         self.exposure_us = max(1, int(exposure_us))
         self.image_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
         self.image_label.setMinimumSize(640, 360)
+        self.warned_no_frame = False
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.image_label)
         controls_layout = QtWidgets.QHBoxLayout()
@@ -275,6 +317,11 @@ class FocusPreviewDialog(QtWidgets.QDialog):
     def _update_frame(self):
         frame = self.camera_manager.snap(self.cam_id, *self.resolution)
         if frame is None:
+            self.image_label.setText("Нет кадра")
+            self.camera_manager.logger.info("Preview: empty frame")
+            if not self.warned_no_frame:
+                QtWidgets.QMessageBox.warning(self, "Preview", "Камера не вернула кадр")
+                self.warned_no_frame = True
             return
         image = cv_to_qimage(frame)
         pixmap = QtGui.QPixmap.fromImage(image)
@@ -303,6 +350,8 @@ class Scanner(QtWidgets.QMainWindow):
     log_signal = QtCore.Signal(str)
     progress_signal = QtCore.Signal(float)
     thumb_signal = QtCore.Signal(QtGui.QImage, int, int)
+    notify_signal = QtCore.Signal(str, str, str)
+    scan_finished_signal = QtCore.Signal()
 
     def __init__(self):
         super().__init__()
@@ -351,6 +400,8 @@ class Scanner(QtWidgets.QMainWindow):
 
         self.progress_signal.connect(self._set_progress)
         self.thumb_signal.connect(self._add_thumb)
+        self.notify_signal.connect(self._show_message)
+        self.scan_finished_signal.connect(self._scan_finished)
 
     # ─────────── сохранение/загрузка калибровки ───────────
     def _load_config(self):
@@ -446,7 +497,9 @@ class Scanner(QtWidgets.QMainWindow):
         settings_row.addWidget(self.cam_combo)
         settings_row.addWidget(QtWidgets.QLabel("Разрешение"))
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["3840x2160", "1920x1080", "1280x720"])
+        self.res_combo.addItems(["2028x1520", "1920x1080", "1332x990", "4056x3040"])
+        if self.resolution not in [self.res_combo.itemText(i) for i in range(self.res_combo.count())]:
+            self.res_combo.addItem(self.resolution)
         self.res_combo.setCurrentText(self.resolution)
         settings_row.addWidget(self.res_combo)
         settings_row.addWidget(QtWidgets.QLabel("FOV X,Y"))
@@ -478,9 +531,9 @@ class Scanner(QtWidgets.QMainWindow):
 
         control_row = QtWidgets.QHBoxLayout()
         scan_layout.addLayout(control_row)
-        btn_scan = QtWidgets.QPushButton("Scan")
-        btn_scan.clicked.connect(self._start_scan)
-        control_row.addWidget(btn_scan)
+        self.btn_scan = QtWidgets.QPushButton("Scan")
+        self.btn_scan.clicked.connect(self._start_scan)
+        control_row.addWidget(self.btn_scan)
         btn_save = QtWidgets.QPushButton("Save")
         btn_save.clicked.connect(self._save)
         control_row.addWidget(btn_save)
@@ -873,12 +926,16 @@ class Scanner(QtWidgets.QMainWindow):
 
     # ─────────── сканирование ───────────
     def _start_scan(self):
+        if self.btn_scan:
+            self.btn_scan.setEnabled(False)
         threading.Thread(target=self._scan, daemon=True).start()
 
     def _scan(self):
+        scan_dir = None
+        frames_dir = None
         try:
             if not (self.ser and self.ser.is_open):
-                self._warn("Serial", "not connected")
+                self._notify("warn", "Serial", "not connected")
                 return
             self._build_grid()
             self.frames.clear()
@@ -891,6 +948,8 @@ class Scanner(QtWidgets.QMainWindow):
             total = len(self.positions)
             self.progress_signal.emit(0)
             res = parse_resolution(self.res_combo.currentText(), (1920, 1080))
+            scan_dir, frames_dir = self._prepare_scan_output()
+            shots = []
             for i, (col, row, x, y) in enumerate(self.positions):
                 if not self._g(f"G1 X{x:.2f} Y{y:.2f} F{feed}"):
                     continue
@@ -901,12 +960,32 @@ class Scanner(QtWidgets.QMainWindow):
                     self.frames.append((frame.copy(), col, row))
                     image = cv_to_qimage(frame)
                     self.thumb_signal.emit(image, col, row)
+                    frame_name = f"frame_{i:04d}_c{col}_r{row}.png"
+                    frame_path = frames_dir / frame_name
+                    cv2.imwrite(str(frame_path), frame)
+                    shots.append(
+                        {
+                            "index": i,
+                            "col": col,
+                            "row": row,
+                            "x": x,
+                            "y": y,
+                            "file": str(frame_path.relative_to(scan_dir)),
+                        }
+                    )
+                else:
+                    self.logger.info("Empty frame at %s,%s", col, row)
                 self.progress_signal.emit((i + 1) / total)
-            self._info("Scan", "done")
+            self._write_shots(scan_dir, shots)
+            self._stitch_multiband()
+            self._save_panorama_auto(scan_dir)
+            self._notify("info", "Scan", "done + stitched")
             self.logger.info("Scan complete")
         except Exception as exc:
-            self._error("Scan", str(exc))
+            self._notify("error", "Scan", str(exc))
             self.logger.info("Scan error: %s", exc)
+        finally:
+            self.scan_finished_signal.emit()
 
     # ─────────── thumb/grid ───────────
     def _add_thumb(self, image, col, row):
@@ -941,14 +1020,14 @@ class Scanner(QtWidgets.QMainWindow):
     def _save(self):
         self._stitch_multiband()
         if self.stitched is None:
-            self._warn("Stitch", "panorama failed")
+            self._notify("warn", "Stitch", "panorama failed")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save", "", "PNG (*.png);;JPEG (*.jpg *.jpeg)"
         )
         if path:
             cv2.imwrite(path, self.stitched)
-            self._info("Saved", path)
+            self._notify("info", "Saved", path)
             self.logger.info("Saved panorama to %s", path)
 
     def _sync_fields(self):
@@ -972,11 +1051,6 @@ class Scanner(QtWidgets.QMainWindow):
         for cam_id, label in self.camera_manager.list_cameras():
             self.cam_combo.addItem(label, cam_id)
         if self.cam_combo.count():
-            preferred = ["/dev/media2", "/dev/media1"]
-            for idx in range(self.cam_combo.count()):
-                if self.cam_combo.itemData(idx) in preferred:
-                    self.cam_combo.setCurrentIndex(idx)
-                    return
             self.cam_combo.setCurrentIndex(0)
 
     def _set_progress(self, value):
@@ -985,14 +1059,69 @@ class Scanner(QtWidgets.QMainWindow):
     def _append_log(self, text):
         self.log_view.appendPlainText(text)
 
+    def _notify(self, level, title, message):
+        self.notify_signal.emit(level, title, message)
+
     def _info(self, title, message):
-        QtWidgets.QMessageBox.information(self, title, message)
+        self._notify("info", title, message)
 
     def _warn(self, title, message):
-        QtWidgets.QMessageBox.warning(self, title, message)
+        self._notify("warn", title, message)
 
     def _error(self, title, message):
-        QtWidgets.QMessageBox.critical(self, title, message)
+        self._notify("error", title, message)
+
+    def _show_message(self, level, title, message):
+        if level == "warn":
+            QtWidgets.QMessageBox.warning(self, title, message)
+        elif level == "error":
+            QtWidgets.QMessageBox.critical(self, title, message)
+        else:
+            QtWidgets.QMessageBox.information(self, title, message)
+
+    def _scan_finished(self):
+        if self.btn_scan:
+            self.btn_scan.setEnabled(True)
+
+    def _prepare_scan_output(self):
+        base = Path("scans")
+        base.mkdir(exist_ok=True)
+        name = self.scan_name_edit.text().strip() or "scan"
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        scan_dir = base / f"{name}_{timestamp}"
+        scan_dir.mkdir(parents=True, exist_ok=True)
+        frames_dir = scan_dir / "scan_frames"
+        frames_dir.mkdir(exist_ok=True)
+        return scan_dir, frames_dir
+
+    def _write_shots(self, scan_dir, shots):
+        data = {
+            "shots": shots,
+            "cols": self.grid_cols,
+            "rows": self.grid_rows,
+            "fovX": f(self.fovx_edit.text()),
+            "fovY": f(self.fovy_edit.text()),
+            "stepX": f(self.stepx_edit.text()),
+            "stepY": f(self.stepy_edit.text()),
+            "resolution": self.res_combo.currentText(),
+        }
+        with open(scan_dir / "shots.json", "w", encoding="utf-8") as fp:
+            json.dump(data, fp, indent=2, ensure_ascii=False)
+
+    def _save_panorama_auto(self, scan_dir):
+        if self.stitched is None:
+            self.logger.info("Panorama failed: stitched is None")
+            return
+        path = scan_dir / "stitched.png"
+        cv2.imwrite(str(path), self.stitched)
+        meta = {
+            "width": int(self.stitched.shape[1]),
+            "height": int(self.stitched.shape[0]),
+            "file": str(path.name),
+        }
+        with open(scan_dir / "stitch_meta.json", "w", encoding="utf-8") as fp:
+            json.dump(meta, fp, indent=2, ensure_ascii=False)
+        self.logger.info("Auto stitched panorama saved to %s", path)
 
     def closeEvent(self, event):
         self._save_config()
