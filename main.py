@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import threading
 import time
 
@@ -81,14 +82,21 @@ class CameraManager:
 
     def list_cameras(self):
         if self.picamera2_cls:
+            media_devices = sorted(
+                Path("/dev").glob("media*"),
+                key=lambda p: p.name,
+            )
+            if media_devices:
+                return [(str(device), f"Media {device}") for device in media_devices]
             infos = self.picamera2_cls.global_camera_info()
             if not infos:
                 return [("0", "Camera 0")]
-            return [
-                (str(idx), info.get("Model", f"Camera {idx}"))
-                for idx, info in enumerate(infos)
-            ]
+            return [(str(idx), info.get("Model", f"Camera {idx}")) for idx, info in enumerate(infos)]
         devices = []
+        for media_device in sorted(Path("/dev").glob("media*"), key=lambda p: p.name):
+            devices.append((str(media_device), f"Media {media_device}"))
+        if devices:
+            return devices
         for idx in range(10):
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if cap.isOpened():
@@ -101,7 +109,8 @@ class CameraManager:
             self.picam.close()
             self.picam = None
         if not self.picam:
-            self.picam = self.picamera2_cls(int(cam_id))
+            cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
+            self.picam = self.picamera2_cls(cam_arg)
             self.picam_id = cam_id
             self.picam_resolution = None
         if self.picam_resolution != resolution:
@@ -117,7 +126,8 @@ class CameraManager:
                 self._ensure_picam(cam_id, (width, height))
                 return self.picam.capture_array()
             backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
-            cap = cv2.VideoCapture(int(cam_id), backend)
+            cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
+            cap = cv2.VideoCapture(cam_arg, backend)
             cap.set(3, width)
             cap.set(4, height)
             for _ in range(3):
@@ -125,6 +135,24 @@ class CameraManager:
             ok, frame = cap.read()
             cap.release()
             return frame if ok else None
+
+    def set_exposure(self, cam_id, exposure_us, resolution=None):
+        exposure = max(1, int(exposure_us))
+        with self.lock:
+            if self.picamera2_cls:
+                if resolution is None:
+                    resolution = self.picam_resolution or parse_resolution(DEFAULT_RESOLUTION)
+                self._ensure_picam(cam_id, resolution)
+                self.picam.set_controls({"ExposureTime": exposure})
+                return True
+            backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
+            cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
+            cap = cv2.VideoCapture(cam_arg, backend)
+            if not cap.isOpened():
+                return False
+            cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
+            cap.release()
+            return True
 
     def close(self):
         with self.lock:
@@ -171,7 +199,7 @@ class GridView(QtWidgets.QWidget):
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
-        painter.fillRect(self.rect(), QtGui.QColor("#202020"))
+        painter.fillRect(self.rect(), QtGui.QColor("#0e1b2b"))
         if not self.grid_cols or not self.grid_rows:
             return
         width = self.width()
@@ -210,19 +238,39 @@ class GridView(QtWidgets.QWidget):
 
 
 class FocusPreviewDialog(QtWidgets.QDialog):
-    def __init__(self, parent, camera_manager, cam_id, resolution):
+    def __init__(self, parent, camera_manager, cam_id, resolution, exposure_us=10000):
         super().__init__(parent)
         self.setWindowTitle("Предпросмотр камеры")
         self.camera_manager = camera_manager
         self.cam_id = cam_id
         self.resolution = resolution
+        self.exposure_us = max(1, int(exposure_us))
         self.image_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
         self.image_label.setMinimumSize(640, 360)
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.image_label)
+        controls_layout = QtWidgets.QHBoxLayout()
+        controls_layout.addWidget(QtWidgets.QLabel("Экспозиция (мкс)"))
+        self.exposure_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.exposure_slider.setRange(100, 200000)
+        self.exposure_slider.setValue(self.exposure_us)
+        self.exposure_spin = QtWidgets.QSpinBox()
+        self.exposure_spin.setRange(100, 200000)
+        self.exposure_spin.setValue(self.exposure_us)
+        self.exposure_slider.valueChanged.connect(self.exposure_spin.setValue)
+        self.exposure_spin.valueChanged.connect(self.exposure_slider.setValue)
+        self.exposure_spin.valueChanged.connect(self._apply_exposure)
+        controls_layout.addWidget(self.exposure_slider)
+        controls_layout.addWidget(self.exposure_spin)
+        layout.addLayout(controls_layout)
+        self._apply_exposure(self.exposure_us)
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._update_frame)
         self.timer.start(200)
+
+    def _apply_exposure(self, value):
+        self.exposure_us = value
+        self.camera_manager.set_exposure(self.cam_id, value, self.resolution)
 
     def _update_frame(self):
         frame = self.camera_manager.snap(self.cam_id, *self.resolution)
@@ -289,6 +337,7 @@ class Scanner(QtWidgets.QMainWindow):
         self.focus_fovX = ""
         self.focus_fovY = ""
         self.focus_step = "1"
+        self.exposure_us = "10000"
 
         self.ser = None
         self.frames = []
@@ -524,6 +573,11 @@ class Scanner(QtWidgets.QMainWindow):
         btn_focus_preview = QtWidgets.QPushButton("Открыть предпросмотр")
         btn_focus_preview.clicked.connect(self._open_focus_preview)
         focus_group_layout.addWidget(btn_focus_preview)
+        focus_group_layout.addWidget(QtWidgets.QLabel("Экспозиция (мкс)"))
+        self.exposure_edit = QtWidgets.QLineEdit(self.exposure_us)
+        self.exposure_edit.setFixedWidth(80)
+        self.exposure_edit.editingFinished.connect(self._apply_exposure_setting)
+        focus_group_layout.addWidget(self.exposure_edit)
         focus_group_layout.addStretch(1)
 
         settings_layout.addStretch(1)
@@ -770,6 +824,8 @@ class Scanner(QtWidgets.QMainWindow):
         self.z_edit.setText(f"{z:.2f}")
         for cmd in (
             "G90",
+            "G28",
+            "M400",
             f"G1 X{CENTER_X:.2f} Y{CENTER_Y:.2f} Z{z:.2f} F{int(f(self.feed_edit.text(), 1500))}",
             "M400",
         ):
@@ -780,8 +836,21 @@ class Scanner(QtWidgets.QMainWindow):
     def _open_focus_preview(self):
         cam = self.cam_combo.currentData() or "0"
         res = parse_resolution(self.res_combo.currentText(), (1920, 1080))
-        dialog = FocusPreviewDialog(self, self.camera_manager, cam, res)
+        dialog = FocusPreviewDialog(
+            self,
+            self.camera_manager,
+            cam,
+            res,
+            f(self.exposure_edit.text(), 10000),
+        )
         dialog.exec()
+
+    def _apply_exposure_setting(self):
+        cam = self.cam_combo.currentData() or "0"
+        res = parse_resolution(self.res_combo.currentText(), (1920, 1080))
+        exposure = f(self.exposure_edit.text(), 10000)
+        self.exposure_us = f"{exposure:.0f}"
+        self.camera_manager.set_exposure(cam, exposure, res)
 
     # ─────────── сетка ───────────
     def _build_grid(self):
@@ -896,12 +965,18 @@ class Scanner(QtWidgets.QMainWindow):
         self.focus_fovx_edit.setText(self.focus_fovX)
         self.focus_fovy_edit.setText(self.focus_fovY)
         self.focus_step_edit.setText(self.focus_step)
+        self.exposure_edit.setText(self.exposure_us)
 
     def _populate_cameras(self):
         self.cam_combo.clear()
         for cam_id, label in self.camera_manager.list_cameras():
             self.cam_combo.addItem(label, cam_id)
         if self.cam_combo.count():
+            preferred = ["/dev/media2", "/dev/media1"]
+            for idx in range(self.cam_combo.count()):
+                if self.cam_combo.itemData(idx) in preferred:
+                    self.cam_combo.setCurrentIndex(idx)
+                    return
             self.cam_combo.setCurrentIndex(0)
 
     def _set_progress(self, value):
@@ -931,6 +1006,52 @@ class Scanner(QtWidgets.QMainWindow):
 if __name__ == "__main__":
     app = QtWidgets.QApplication([])
     app.setStyle("Fusion")
+    app.setStyleSheet(
+        """
+        QWidget {
+            background-color: #0e1b2b;
+            color: #e0e6f0;
+        }
+        QGroupBox {
+            border: 1px solid #2a3d55;
+            margin-top: 10px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 4px;
+        }
+        QLineEdit, QComboBox, QSpinBox, QPlainTextEdit {
+            background-color: #13243a;
+            border: 1px solid #2a3d55;
+            padding: 4px;
+        }
+        QPushButton {
+            background-color: #1c3550;
+            border: 1px solid #2a3d55;
+            padding: 6px 10px;
+        }
+        QPushButton:hover {
+            background-color: #244465;
+        }
+        QProgressBar {
+            background-color: #13243a;
+            border: 1px solid #2a3d55;
+            text-align: center;
+        }
+        QProgressBar::chunk {
+            background-color: #2e5d86;
+        }
+        QTabBar::tab {
+            background-color: #13243a;
+            padding: 6px 12px;
+            border: 1px solid #2a3d55;
+        }
+        QTabBar::tab:selected {
+            background-color: #1c3550;
+        }
+        """
+    )
     window = Scanner()
     window.show()
     app.exec()
