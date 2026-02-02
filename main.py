@@ -169,6 +169,26 @@ class CameraManager:
             cap.release()
             return frame if ok else None
 
+    def warm_up(self, cam_id, width=1920, height=1080):
+        with self.lock:
+            if self.picamera2_cls:
+                try:
+                    self._ensure_picam(cam_id, (width, height))
+                    return True
+                except Exception as exc:
+                    self.logger.info("Picamera2 warm up failed: %s", exc)
+                    return False
+            backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
+            cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
+            cap = cv2.VideoCapture(cam_arg, backend)
+            if not cap.isOpened():
+                return False
+            cap.set(3, width)
+            cap.set(4, height)
+            cap.read()
+            cap.release()
+            return True
+
     def set_exposure(self, cam_id, exposure_us, resolution=None):
         exposure = max(1, int(exposure_us))
         with self.lock:
@@ -402,6 +422,7 @@ class Scanner(QtWidgets.QMainWindow):
         self.thumb_signal.connect(self._add_thumb)
         self.notify_signal.connect(self._show_message)
         self.scan_finished_signal.connect(self._scan_finished)
+        QtCore.QTimer.singleShot(0, self._auto_connect_camera)
 
     # ─────────── сохранение/загрузка калибровки ───────────
     def _load_config(self):
@@ -1052,6 +1073,15 @@ class Scanner(QtWidgets.QMainWindow):
             self.cam_combo.addItem(label, cam_id)
         if self.cam_combo.count():
             self.cam_combo.setCurrentIndex(0)
+
+    def _auto_connect_camera(self):
+        cam = self.cam_combo.currentData() or "0"
+        res = parse_resolution(self.res_combo.currentText(), (1920, 1080))
+        ok = self.camera_manager.warm_up(cam, *res)
+        if ok:
+            self.logger.info("Camera ready: %s @ %sx%s", cam, res[0], res[1])
+        else:
+            self.logger.info("Camera warm up failed")
 
     def _set_progress(self, value):
         self.progress.setValue(int(value * 100))
