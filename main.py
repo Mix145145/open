@@ -19,6 +19,8 @@ import os
 from pathlib import Path
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import cv2
 import numpy as np
@@ -34,6 +36,11 @@ CAL_Z_MM = 83
 STEP_FACTOR = 0.80  # смарт-шаг = 0.80 × FOV  (≈ 20 %)
 CONFIG_FILE = "aruco_calib.json"
 DEFAULT_RESOLUTION = "2028x1520"
+RESOLUTION_PRESETS = {
+    "FHD": "1920x1080",
+    "2K": "2560x1440",
+    "4K": "3840x2160",
+}
 CENTER_X = 54
 CENTER_Y = 110
 
@@ -224,6 +231,64 @@ class CameraManager:
                 self.picam_resolution = None
 
 
+
+
+class LocalControlServer:
+    def __init__(self, scanner, logger, host="0.0.0.0", port=8765):
+        self.scanner = scanner
+        self.logger = logger
+        self.host = host
+        self.port = port
+        self.httpd = None
+        self.thread = None
+
+    def start(self):
+        scanner = self.scanner
+        logger = self.logger
+
+        class Handler(BaseHTTPRequestHandler):
+            def _json(self, code, payload):
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                if parsed.path == "/status":
+                    self._json(200, {
+                        "serial_connected": bool(scanner.ser and scanner.ser.is_open),
+                        "serial_port": scanner.comb_ports.currentText() if hasattr(scanner, "comb_ports") else "",
+                        "camera": scanner.cam_combo.currentData() if hasattr(scanner, "cam_combo") else "0",
+                        "resolution": scanner.res_combo.currentText() if hasattr(scanner, "res_combo") else DEFAULT_RESOLUTION,
+                    })
+                    return
+                if parsed.path == "/gcode":
+                    cmd = parse_qs(parsed.query).get("cmd", [""])[0].strip()
+                    if not cmd:
+                        self._json(400, {"ok": False, "error": "missing cmd"})
+                        return
+                    ok = scanner._g(cmd)
+                    self._json(200, {"ok": bool(ok), "cmd": cmd})
+                    return
+                self._json(404, {"ok": False, "error": "not found"})
+
+            def log_message(self, format, *args):
+                logger.info("LAN API: " + format, *args)
+
+        self.httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.logger.info("LAN API started on http://%s:%s", self.host, self.port)
+
+    def stop(self):
+        if self.httpd:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+            self.httpd = None
+
 class QtLogHandler(logging.Handler):
     def __init__(self, signal):
         super().__init__()
@@ -386,6 +451,7 @@ class Scanner(QtWidgets.QMainWindow):
         self.logger.addHandler(handler)
 
         self.camera_manager = CameraManager(self.logger)
+        self.local_server = LocalControlServer(self, self.logger)
 
         self.com = ""
         self.cam = "0"
@@ -407,6 +473,12 @@ class Scanner(QtWidgets.QMainWindow):
         self.focus_fovY = ""
         self.focus_step = "1"
         self.exposure_us = "10000"
+        self.fov_move_equals_step = True
+        self.fov_profiles = {
+            RESOLUTION_PRESETS["FHD"]: {"fovX": 30.0, "fovY": 17.0},
+            RESOLUTION_PRESETS["2K"]: {"fovX": 30.0, "fovY": 17.0},
+            RESOLUTION_PRESETS["4K"]: {"fovX": 30.0, "fovY": 17.0},
+        }
 
         self.ser = None
         self.frames = []
@@ -423,6 +495,8 @@ class Scanner(QtWidgets.QMainWindow):
         self.notify_signal.connect(self._show_message)
         self.scan_finished_signal.connect(self._scan_finished)
         QtCore.QTimer.singleShot(0, self._auto_connect_camera)
+        QtCore.QTimer.singleShot(0, self._auto_connect_serial)
+        self.local_server.start()
 
     # ─────────── сохранение/загрузка калибровки ───────────
     def _load_config(self):
@@ -438,7 +512,14 @@ class Scanner(QtWidgets.QMainWindow):
                 self.focus_profiles = data.get("focus_profiles", {})
                 self.scan_profile = data.get("selected_scan_profile", "")
                 self.focus_profile = data.get("selected_focus_profile", "")
-                self._apply_steps()
+                loaded_fov_profiles = data.get("fov_profiles", {})
+                for res, values in loaded_fov_profiles.items():
+                    self.fov_profiles[res] = {
+                        "fovX": float(values.get("fovX", self.fov_profiles.get(res, {}).get("fovX", 30.0))),
+                        "fovY": float(values.get("fovY", self.fov_profiles.get(res, {}).get("fovY", 17.0))),
+                    }
+                self.fov_move_equals_step = bool(data.get("fov_move_equals_step", True))
+                self._apply_fov_profile_for_resolution(self.resolution)
             except Exception:
                 self.logger.info("Не удалось прочитать конфиг, использую значения по умолчанию")
         if not hasattr(self, "scan_profiles"):
@@ -468,6 +549,8 @@ class Scanner(QtWidgets.QMainWindow):
                         "focus_profiles": self.focus_profiles,
                         "selected_scan_profile": self.scan_profile,
                         "selected_focus_profile": self.focus_profile,
+                        "fov_profiles": self.fov_profiles,
+                        "fov_move_equals_step": self.fov_move_equals_step,
                     },
                     fp,
                     indent=2,
@@ -518,10 +601,11 @@ class Scanner(QtWidgets.QMainWindow):
         settings_row.addWidget(self.cam_combo)
         settings_row.addWidget(QtWidgets.QLabel("Разрешение"))
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["2028x1520", "1920x1080", "1332x990", "4056x3040"])
+        self.res_combo.addItems([RESOLUTION_PRESETS["FHD"], RESOLUTION_PRESETS["2K"], RESOLUTION_PRESETS["4K"], "2028x1520", "1332x990", "4056x3040"])
         if self.resolution not in [self.res_combo.itemText(i) for i in range(self.res_combo.count())]:
             self.res_combo.addItem(self.resolution)
         self.res_combo.setCurrentText(self.resolution)
+        self.res_combo.currentTextChanged.connect(self._on_resolution_changed)
         settings_row.addWidget(self.res_combo)
         settings_row.addWidget(QtWidgets.QLabel("FOV X,Y"))
         self.fovx_edit = QtWidgets.QLineEdit(self.fovX)
@@ -545,9 +629,6 @@ class Scanner(QtWidgets.QMainWindow):
         self.feed_edit = QtWidgets.QLineEdit(self.feed)
         self.feed_edit.setFixedWidth(60)
         settings_row.addWidget(self.feed_edit)
-        btn_calib = QtWidgets.QPushButton("Калибровка")
-        btn_calib.clicked.connect(self._start_calibration)
-        settings_row.addWidget(btn_calib)
         settings_row.addStretch(1)
 
         control_row = QtWidgets.QHBoxLayout()
@@ -654,6 +735,37 @@ class Scanner(QtWidgets.QMainWindow):
         focus_group_layout.addWidget(self.exposure_edit)
         focus_group_layout.addStretch(1)
 
+        fov_group = QtWidgets.QGroupBox("Настройки FOV")
+        settings_layout.addWidget(fov_group)
+        fov_layout = QtWidgets.QHBoxLayout(fov_group)
+        fov_layout.addWidget(QtWidgets.QLabel("Режим"))
+        self.fov_res_mode_combo = QtWidgets.QComboBox()
+        self.fov_res_mode_combo.addItems(list(RESOLUTION_PRESETS.keys()))
+        fov_layout.addWidget(self.fov_res_mode_combo)
+        fov_layout.addWidget(QtWidgets.QLabel("FOV X,Y (мм)"))
+        self.fov_profile_x_edit = QtWidgets.QLineEdit(self.fovX)
+        self.fov_profile_y_edit = QtWidgets.QLineEdit(self.fovY)
+        self.fov_profile_x_edit.setFixedWidth(70)
+        self.fov_profile_y_edit.setFixedWidth(70)
+        fov_layout.addWidget(self.fov_profile_x_edit)
+        fov_layout.addWidget(self.fov_profile_y_edit)
+        self.fov_move_checkbox = QtWidgets.QCheckBox("FOV = Move (шаг = FOV)")
+        self.fov_move_checkbox.setChecked(self.fov_move_equals_step)
+        fov_layout.addWidget(self.fov_move_checkbox)
+        btn_fov_apply = QtWidgets.QPushButton("Сохранить FOV")
+        btn_fov_apply.clicked.connect(self._save_active_fov_profile)
+        fov_layout.addWidget(btn_fov_apply)
+        btn_fov_center = QtWidgets.QPushButton("В центр на высоту")
+        btn_fov_center.clicked.connect(self._move_to_fov_center)
+        fov_layout.addWidget(btn_fov_center)
+        btn_fov_preview = QtWidgets.QPushButton("Вид с камеры")
+        btn_fov_preview.clicked.connect(self._open_focus_preview)
+        fov_layout.addWidget(btn_fov_preview)
+        fov_layout.addStretch(1)
+
+        self.fov_res_mode_combo.currentTextChanged.connect(self._on_fov_mode_changed)
+        self.fov_move_checkbox.toggled.connect(self._on_fov_move_toggled)
+
         settings_layout.addStretch(1)
 
     # ─────────── Serial ───────────
@@ -674,8 +786,11 @@ class Scanner(QtWidgets.QMainWindow):
         ports = [p.device for p in serial.tools.list_ports.comports()]
         self.comb_ports.clear()
         self.comb_ports.addItems(ports)
-        if ports:
-            self.comb_ports.setCurrentIndex(0)
+        if not ports:
+            return
+        preferred = "/dev/ttyUSB0"
+        index = self.comb_ports.findText(preferred)
+        self.comb_ports.setCurrentIndex(index if index >= 0 else 0)
 
     def _g(self, cmd):
         if not (self.ser and self.ser.is_open):
@@ -695,9 +810,82 @@ class Scanner(QtWidgets.QMainWindow):
 
     # ─────────── smart-step ───────────
     def _apply_steps(self):
+        if self.fov_move_equals_step:
+            self.stepX = f"{float(self.fovX):.2f}"
+            self.stepY = f"{float(self.fovY):.2f}"
+            return
         k = STEP_FACTOR
         self.stepX = f"{float(self.fovX) * k:.2f}"
         self.stepY = f"{float(self.fovY) * k:.2f}"
+
+    def _resolution_key_from_mode(self, mode_name):
+        return RESOLUTION_PRESETS.get(mode_name, self.res_combo.currentText())
+
+    def _mode_from_resolution(self, resolution):
+        for mode, res in RESOLUTION_PRESETS.items():
+            if res == resolution:
+                return mode
+        return "FHD"
+
+    def _apply_fov_profile_for_resolution(self, resolution):
+        profile = self.fov_profiles.get(resolution)
+        if not profile:
+            profile = {"fovX": float(self.fovX), "fovY": float(self.fovY)}
+            self.fov_profiles[resolution] = profile
+        self.fovX = f"{float(profile.get('fovX', self.fovX)):.2f}"
+        self.fovY = f"{float(profile.get('fovY', self.fovY)):.2f}"
+        self._apply_steps()
+
+    def _save_active_fov_profile(self):
+        mode = self.fov_res_mode_combo.currentText()
+        resolution = self._resolution_key_from_mode(mode)
+        fx = f(self.fov_profile_x_edit.text(), f(self.fovx_edit.text(), 30.0))
+        fy = f(self.fov_profile_y_edit.text(), f(self.fovy_edit.text(), 17.0))
+        if fx <= 0 or fy <= 0:
+            self._warn("FOV", "FOV должен быть > 0")
+            return
+        self.fov_profiles[resolution] = {"fovX": fx, "fovY": fy}
+        self.res_combo.setCurrentText(resolution)
+        self._apply_fov_profile_for_resolution(resolution)
+        self._sync_fields()
+        self._save_config()
+        self.logger.info("FOV profile saved for %s: %.2f x %.2f", resolution, fx, fy)
+
+    def _on_fov_mode_changed(self, mode):
+        resolution = self._resolution_key_from_mode(mode)
+        self.res_combo.setCurrentText(resolution)
+
+    def _on_resolution_changed(self, resolution):
+        self.resolution = resolution
+        self._apply_fov_profile_for_resolution(resolution)
+        if hasattr(self, "fov_res_mode_combo"):
+            mode = self._mode_from_resolution(resolution)
+            self.fov_res_mode_combo.blockSignals(True)
+            self.fov_res_mode_combo.setCurrentText(mode)
+            self.fov_res_mode_combo.blockSignals(False)
+        self._sync_fields()
+
+    def _on_fov_move_toggled(self, checked):
+        self.fov_move_equals_step = bool(checked)
+        self._apply_steps()
+        self._sync_fields()
+        self._save_config()
+
+    def _move_to_fov_center(self):
+        if not (self.ser and self.ser.is_open):
+            self._warn("Serial", "not connected")
+            return
+        z = f(self.focus_z_edit.text(), CAL_Z_MM)
+        self.z_edit.setText(f"{z:.2f}")
+        for cmd in (
+            "G90",
+            "M400",
+            f"G1 X{CENTER_X:.2f} Y{CENTER_Y:.2f} Z{z:.2f} F{int(f(self.feed_edit.text(), 1500))}",
+            "M400",
+        ):
+            if not self._g(cmd):
+                return
+        self.logger.info("FOV setup position: center at Z=%s", z)
 
     # ─────────── калибровка ───────────
     def _start_calibration(self):
@@ -796,10 +984,8 @@ class Scanner(QtWidgets.QMainWindow):
             self.focus_z = str(focus.get("z", ""))
             self.focus_fovX = str(focus.get("fovX", ""))
             self.focus_fovY = str(focus.get("fovY", ""))
-            self.fovX = f"{float(focus.get('fovX', self.fovX)):.2f}"
-            self.fovY = f"{float(focus.get('fovY', self.fovY)):.2f}"
             self.z = f"{float(focus.get('z', self.z)):.2f}"
-            self._apply_steps()
+            self._apply_fov_profile_for_resolution(self.resolution)
 
     def _select_scan_profile(self, name):
         self.scan_profile = name
@@ -850,12 +1036,7 @@ class Scanner(QtWidgets.QMainWindow):
             self._warn("Профиль", "Введите имя профиля")
             return
         z = f(self.focus_z_edit.text())
-        fovx = f(self.focus_fovx_edit.text())
-        fovy = f(self.focus_fovy_edit.text())
-        if fovx <= 0 or fovy <= 0:
-            self._warn("Профиль", "FOV должен быть > 0")
-            return
-        self.focus_profiles[name] = {"z": z, "fovX": fovx, "fovY": fovy}
+        self.focus_profiles[name] = {"z": z}
         self.focus_profile = name
         self.focus_profiles_box.clear()
         self.focus_profiles_box.addItems(list(self.focus_profiles))
@@ -1066,13 +1247,38 @@ class Scanner(QtWidgets.QMainWindow):
         self.focus_fovy_edit.setText(self.focus_fovY)
         self.focus_step_edit.setText(self.focus_step)
         self.exposure_edit.setText(self.exposure_us)
+        if hasattr(self, "fov_profile_x_edit"):
+            mode = self._mode_from_resolution(self.res_combo.currentText())
+            self.fov_res_mode_combo.blockSignals(True)
+            self.fov_res_mode_combo.setCurrentText(mode)
+            self.fov_res_mode_combo.blockSignals(False)
+            active_res = self._resolution_key_from_mode(mode)
+            profile = self.fov_profiles.get(active_res, {"fovX": f(self.fovX), "fovY": f(self.fovY)})
+            self.fov_profile_x_edit.setText(f"{float(profile.get('fovX', self.fovX)):.2f}")
+            self.fov_profile_y_edit.setText(f"{float(profile.get('fovY', self.fovY)):.2f}")
+            self.fov_move_checkbox.setChecked(self.fov_move_equals_step)
+        self.stepx_edit.setReadOnly(self.fov_move_equals_step)
+        self.stepy_edit.setReadOnly(self.fov_move_equals_step)
 
     def _populate_cameras(self):
         self.cam_combo.clear()
         for cam_id, label in self.camera_manager.list_cameras():
             self.cam_combo.addItem(label, cam_id)
         if self.cam_combo.count():
-            self.cam_combo.setCurrentIndex(0)
+            preferred = -1
+            for i in range(self.cam_combo.count()):
+                if "imx477" in self.cam_combo.itemText(i).lower():
+                    preferred = i
+                    break
+            if preferred < 0:
+                preferred = self.cam_combo.findData("0")
+            self.cam_combo.setCurrentIndex(preferred if preferred >= 0 else 0)
+
+    def _auto_connect_serial(self):
+        port = self.comb_ports.currentText().strip()
+        if not port:
+            return
+        self._connect()
 
     def _auto_connect_camera(self):
         cam = self.cam_combo.currentData() or "0"
@@ -1156,6 +1362,7 @@ class Scanner(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self._save_config()
         self.camera_manager.close()
+        self.local_server.stop()
         if self.ser and self.ser.is_open:
             self.ser.close()
         super().closeEvent(event)
