@@ -423,6 +423,114 @@ class FocusPreviewDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
+class FrameSetupDialog(QtWidgets.QDialog):
+    def __init__(self, parent, camera_manager, cam_id, resolution, exposure_us, fov_profiles, current_resolution):
+        super().__init__(parent)
+        self.setWindowTitle("Настройка кадра")
+        self.camera_manager = camera_manager
+        self.cam_id = cam_id
+        self.resolution = resolution
+        self.exposure_us = max(1, int(exposure_us))
+        self.fov_profiles = fov_profiles
+
+        layout = QtWidgets.QVBoxLayout(self)
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("Качество"))
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItems(list(RESOLUTION_PRESETS.keys()))
+        controls.addWidget(self.mode_combo)
+        controls.addWidget(QtWidgets.QLabel("FOV X,Y (мм)"))
+        self.fov_x_edit = QtWidgets.QLineEdit("30.00")
+        self.fov_y_edit = QtWidgets.QLineEdit("17.00")
+        self.fov_x_edit.setFixedWidth(80)
+        self.fov_y_edit.setFixedWidth(80)
+        controls.addWidget(self.fov_x_edit)
+        controls.addWidget(self.fov_y_edit)
+        self.btn_save = QtWidgets.QPushButton("Сохранить")
+        controls.addWidget(self.btn_save)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.image_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
+        self.image_label.setMinimumSize(640, 360)
+        layout.addWidget(self.image_label)
+
+        exp_controls = QtWidgets.QHBoxLayout()
+        exp_controls.addWidget(QtWidgets.QLabel("Экспозиция (мкс)"))
+        self.exposure_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.exposure_slider.setRange(100, 200000)
+        self.exposure_slider.setValue(self.exposure_us)
+        self.exposure_spin = QtWidgets.QSpinBox()
+        self.exposure_spin.setRange(100, 200000)
+        self.exposure_spin.setValue(self.exposure_us)
+        self.exposure_slider.valueChanged.connect(self.exposure_spin.setValue)
+        self.exposure_spin.valueChanged.connect(self.exposure_slider.setValue)
+        self.exposure_spin.valueChanged.connect(self._apply_exposure)
+        exp_controls.addWidget(self.exposure_slider)
+        exp_controls.addWidget(self.exposure_spin)
+        layout.addLayout(exp_controls)
+
+        self.warned_no_frame = False
+        self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
+        self.btn_save.clicked.connect(self._save_profile)
+
+        self._apply_exposure(self.exposure_us)
+        self._set_mode_from_resolution(current_resolution)
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._update_frame)
+        self.timer.start(200)
+
+    def _set_mode_from_resolution(self, resolution):
+        for mode, res in RESOLUTION_PRESETS.items():
+            if res == resolution:
+                self.mode_combo.setCurrentText(mode)
+                return
+        self.mode_combo.setCurrentText("FHD")
+
+    def _on_mode_changed(self, mode):
+        self.resolution = parse_resolution(RESOLUTION_PRESETS.get(mode, DEFAULT_RESOLUTION), (1920, 1080))
+        profile = self.fov_profiles.get(RESOLUTION_PRESETS[mode], {"fovX": 30.0, "fovY": 17.0})
+        self.fov_x_edit.setText(f"{float(profile.get('fovX', 30.0)):.2f}")
+        self.fov_y_edit.setText(f"{float(profile.get('fovY', 17.0)):.2f}")
+
+    def _apply_exposure(self, value):
+        self.exposure_us = value
+        self.camera_manager.set_exposure(self.cam_id, value, self.resolution)
+
+    def _save_profile(self):
+        mode = self.mode_combo.currentText()
+        fx = f(self.fov_x_edit.text(), 0)
+        fy = f(self.fov_y_edit.text(), 0)
+        if fx <= 0 or fy <= 0:
+            QtWidgets.QMessageBox.warning(self, "FOV", "FOV должен быть > 0")
+            return
+        self.fov_profiles[RESOLUTION_PRESETS[mode]] = {"fovX": fx, "fovY": fy}
+        self.accept()
+
+    def _update_frame(self):
+        frame = self.camera_manager.snap(self.cam_id, *self.resolution)
+        if frame is None:
+            self.image_label.setText("Нет кадра")
+            if not self.warned_no_frame:
+                QtWidgets.QMessageBox.warning(self, "Preview", "Камера не вернула кадр")
+                self.warned_no_frame = True
+            return
+        image = cv_to_qimage(frame)
+        pixmap = QtGui.QPixmap.fromImage(image)
+        self.image_label.setPixmap(
+            pixmap.scaled(
+                self.image_label.size(),
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            )
+        )
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        super().closeEvent(event)
+
+
 def cv_to_qimage(frame):
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
@@ -636,6 +744,13 @@ class Scanner(QtWidgets.QMainWindow):
         self.btn_scan = QtWidgets.QPushButton("Scan")
         self.btn_scan.clicked.connect(self._start_scan)
         control_row.addWidget(self.btn_scan)
+        self.fov_move_scan_checkbox = QtWidgets.QCheckBox("FOV = Move")
+        self.fov_move_scan_checkbox.setChecked(self.fov_move_equals_step)
+        self.fov_move_scan_checkbox.toggled.connect(self._on_fov_move_toggled)
+        control_row.addWidget(self.fov_move_scan_checkbox)
+        btn_frame_setup = QtWidgets.QPushButton("Настройка кадра")
+        btn_frame_setup.clicked.connect(self._start_frame_setup)
+        control_row.addWidget(btn_frame_setup)
         btn_save = QtWidgets.QPushButton("Save")
         btn_save.clicked.connect(self._save)
         control_row.addWidget(btn_save)
@@ -868,8 +983,53 @@ class Scanner(QtWidgets.QMainWindow):
     def _on_fov_move_toggled(self, checked):
         self.fov_move_equals_step = bool(checked)
         self._apply_steps()
+        if hasattr(self, "fov_move_checkbox") and self.fov_move_checkbox.isChecked() != self.fov_move_equals_step:
+            self.fov_move_checkbox.blockSignals(True)
+            self.fov_move_checkbox.setChecked(self.fov_move_equals_step)
+            self.fov_move_checkbox.blockSignals(False)
+        if hasattr(self, "fov_move_scan_checkbox") and self.fov_move_scan_checkbox.isChecked() != self.fov_move_equals_step:
+            self.fov_move_scan_checkbox.blockSignals(True)
+            self.fov_move_scan_checkbox.setChecked(self.fov_move_equals_step)
+            self.fov_move_scan_checkbox.blockSignals(False)
         self._sync_fields()
         self._save_config()
+
+    def _start_frame_setup(self):
+        if not (self.ser and self.ser.is_open):
+            self._warn("Serial", "not connected")
+            return
+        z = f(self.focus_z_edit.text(), CAL_Z_MM)
+        self.z_edit.setText(f"{z:.2f}")
+        feed = int(f(self.feed_edit.text(), 1500))
+        for cmd in (
+            "G90",
+            "M400",
+            f"G1 X{CENTER_X:.2f} Y{CENTER_Y:.2f} Z{z:.2f} F{feed}",
+            "M400",
+        ):
+            if not self._g(cmd):
+                return
+        self.logger.info("Frame setup position: center at Z=%s", z)
+
+        cam = self.cam_combo.currentData() or "0"
+        res = parse_resolution(self.res_combo.currentText(), (1920, 1080))
+        dialog = FrameSetupDialog(
+            self,
+            self.camera_manager,
+            cam,
+            res,
+            f(self.exposure_edit.text(), 10000),
+            self.fov_profiles,
+            self.res_combo.currentText(),
+        )
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            selected_mode = dialog.mode_combo.currentText()
+            selected_res = RESOLUTION_PRESETS.get(selected_mode, self.res_combo.currentText())
+            self.res_combo.setCurrentText(selected_res)
+            self._apply_fov_profile_for_resolution(selected_res)
+            self.exposure_us = f"{dialog.exposure_us:.0f}"
+            self._sync_fields()
+            self._save_config()
 
     def _move_to_fov_center(self):
         if not (self.ser and self.ser.is_open):
@@ -1206,6 +1366,30 @@ class Scanner(QtWidgets.QMainWindow):
         ppx, ppy = w / fx, h / fy
         width = int((cols - 1) * sx * ppx + w)
         height = int((rows - 1) * sy * ppy + h)
+
+        if self.fov_move_equals_step:
+            canvas = np.zeros((height, width, 3), dtype=np.float32)
+            weight = np.zeros((height, width), dtype=np.float32)
+            feather_x = max(8, int(w * 0.03))
+            feather_y = max(8, int(h * 0.03))
+            mask = np.ones((h, w), dtype=np.float32)
+            ramp_x = np.linspace(0.0, 1.0, feather_x, dtype=np.float32)
+            ramp_y = np.linspace(0.0, 1.0, feather_y, dtype=np.float32)
+            mask[:, :feather_x] *= ramp_x[np.newaxis, :]
+            mask[:, -feather_x:] *= ramp_x[::-1][np.newaxis, :]
+            mask[:feather_y, :] *= ramp_y[:, np.newaxis]
+            mask[-feather_y:, :] *= ramp_y[::-1][:, np.newaxis]
+            for frame, c, r in self.frames:
+                ox = int(c * sx * ppx)
+                oy = int((rows - 1 - r) * sy * ppy)
+                roi = canvas[oy:oy + h, ox:ox + w]
+                wroi = weight[oy:oy + h, ox:ox + w]
+                roi += frame.astype(np.float32) * mask[..., None]
+                wroi += mask
+            weight = np.clip(weight, 1e-6, None)
+            self.stitched = np.clip(canvas / weight[..., None], 0, 255).astype(np.uint8)
+            return
+
         blender = cv2.detail_MultiBandBlender()
         blender.setNumBands(5)
         blender.prepare((0, 0, width, height))
@@ -1257,6 +1441,8 @@ class Scanner(QtWidgets.QMainWindow):
             self.fov_profile_x_edit.setText(f"{float(profile.get('fovX', self.fovX)):.2f}")
             self.fov_profile_y_edit.setText(f"{float(profile.get('fovY', self.fovY)):.2f}")
             self.fov_move_checkbox.setChecked(self.fov_move_equals_step)
+        if hasattr(self, "fov_move_scan_checkbox"):
+            self.fov_move_scan_checkbox.setChecked(self.fov_move_equals_step)
         self.stepx_edit.setReadOnly(self.fov_move_equals_step)
         self.stepy_edit.setReadOnly(self.fov_move_equals_step)
 
@@ -1340,6 +1526,7 @@ class Scanner(QtWidgets.QMainWindow):
             "stepX": f(self.stepx_edit.text()),
             "stepY": f(self.stepy_edit.text()),
             "resolution": self.res_combo.currentText(),
+            "fov_move_equals_step": bool(self.fov_move_equals_step),
         }
         with open(scan_dir / "shots.json", "w", encoding="utf-8") as fp:
             json.dump(data, fp, indent=2, ensure_ascii=False)
